@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata:
+  RepoUrl: https://github.com/mludvig/aws-ethereum-miner
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Miner Configuration
+        Parameters:
+        - EthWallet
+
+      - Label:
+          default: Instance Configuration
+        Parameters:
+        - InstanceType
+        - InstanceAmi
+
+      - Label:
+          default: Networking Configuration
+        Parameters:
+        - VpcId
+        - SubnetIds
+
+Parameters:
+  InstanceType:
+    Type: String
+    AllowedValues:
+    ## The commented-out are not worth it - too slow for the price
+    #- g3s.xlarge    # 1 GPU Tesla M60
+    #- g3.8xlarge    # 2 GPU Tesla M60
+    - g4dn.xlarge   # 1 GPU Tesla T4 -- best value (cost/performance)
+    - g4dn.2xlarge  # 1 GPU Tesla T4
+    - g4dn.12xlarge # 4 GPU Tesla T4
+    #- p2.xlarge     # 1 GPU Tesla K80
+    #- p2.8xlarge    # 8 GPU Tesla K80
+    #- p2.16xlarge   # 16 GPU Tesla K80
+    - p3.2xlarge    # 1 GPU Tesla V100
+    - p3.8xlarge    # 4 GPU Tesla V100
+    - p3.16xlarge   # 8 GPU Tesla V100
+    Default: g4dn.xlarge
+
+  InstanceCount:
+    Type: Number
+    Default: 5
+    MaxValue: 10
+
+  EthWallet:
+    Type: String
+    Description: Ethereum Wallet Address
+    Default: "0xfb22eb557380e8b35327d34cb764485dfd98a0ce"
+    AllowedPattern: "0x[0-9a-fA-F]+"
+
+  VpcId:
+    Description: The VPC where this stack will be deployed
+    Type: AWS::EC2::VPC::Id
+
+  SubnetIds:
+    Description: The subnets where the instances will be deployed - at least 3 subnets!
+    Type: List<AWS::EC2::Subnet::Id>
+
+Mappings:
+  # ImageId of 'Deep Learning AMI (Ubuntu 18.04) Version 36.0' in each region
+  RegionMap:
+    ap-northeast-1:
+      ImageId: ami-03b8cfea5460e4881
+    ap-northeast-2:
+      ImageId: ami-07e004f63a0cccdd3
+    ap-south-1:
+      ImageId: ami-02cb047909c100c3d
+    ap-southeast-1:
+      ImageId: ami-068f673b54015684e
+    ap-southeast-2:
+      ImageId: ami-0f558ede443627831
+    ca-central-1:
+      ImageId: ami-0ca5bba27cf7db8f0
+    eu-central-1:
+      ImageId: ami-01227276a4e5a4a31
+    eu-north-1:
+      ImageId: ami-080691999cd85e762
+    eu-west-1:
+      ImageId: ami-006ff58f5247c50eb
+    eu-west-2:
+      ImageId: ami-096a6497745975f89
+    eu-west-3:
+      ImageId: ami-0346672391424d8e5
+    sa-east-1:
+      ImageId: ami-048837a0bfc1ba1a6
+    us-east-1:
+      ImageId: ami-063585f0e06d22308
+    us-east-2:
+      ImageId: ami-01bd6a1621a6968d7
+    us-west-1:
+      ImageId: ami-05fbe06ba1b862ef6
+    us-west-2:
+      ImageId: ami-0bc87a16c757a7f07
+
+  SpotPriceMap:
+    g4dn.xlarge:
+      MaxPrice: 0.16
+    g4dn.2xlarge:
+      MaxPrice: 0.23
+    g4dn.12xlarge:
+      MaxPrice: 1.57
+    p3.2xlarge:
+      MaxPrice: 0.92
+    p3.8xlarge:
+      MaxPrice: 3.68
+    p3.16xlarge:
+      MaxPrice: 7.36
+
+Resources:
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref InstanceRole
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        InstanceMarketOptions:
+          MarketType: spot
+          SpotOptions:
+            SpotInstanceType: one-time
+            MaxPrice: !FindInMap [ SpotPriceMap, !Ref InstanceType, MaxPrice ]
+        InstanceType: !Ref InstanceType
+        ImageId: !FindInMap [ RegionMap, !Ref "AWS::Region", ImageId ]
+        SecurityGroupIds:
+        - !Ref SecurityGroup
+        UserData:
+          'Fn::Base64':
+            'Fn::Sub': |
+                #!/bin/bash -x
+                cd /tmp
+                INSTANCE_ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+                wget -O ethminer.tar.gz https://github.com/ethereum-mining/ethminer/releases/download/v0.18.0/ethminer-0.18.0-cuda-9-linux-x86_64.tar.gz
+                tar xvfz ethminer.tar.gz
+                cd bin
+                cat > runner.sh << __EOF__
+                #!/bin/bash -x
+                SERVERS=(us1 us2 eu1 asia1)
+                while (true); do
+                  PREFERRED_SERVER=\${!SERVERS[\${!RANDOM} % \${!#SERVERS[@]}]}
+                  ./ethminer \
+                    -P stratums://${EthWallet}.${!INSTANCE_ID}@\${!PREFERRED_SERVER}.ethermine.org:5555 \
+                    -P stratums://${EthWallet}.${!INSTANCE_ID}@us1.ethermine.org:5555 \
+                    -P stratums://${EthWallet}.${!INSTANCE_ID}@us2.ethermine.org:5555 \
+                    -P stratums://${EthWallet}.${!INSTANCE_ID}@eu1.ethermine.org:5555 \
+                    -P stratums://${EthWallet}.${!INSTANCE_ID}@asia1.ethermine.org:5555 \
+                  >> /tmp/ethminer.log 2>&1
+                done
+                __EOF__
+                chmod +x runner.sh
+                nohup ./runner.sh &
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Ref AWS::StackName
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+
+  MinerAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 0
+      MaxSize: !Ref InstanceCount
+      DesiredCapacity: !Ref InstanceCount
+      CapacityRebalance: false
+      VPCZoneIdentifier: !Ref SubnetIds
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      TerminationPolicies:
+      - ClosestToNextInstanceHour
+      NotificationConfigurations:
+      - TopicARN: !Ref NotificationTopic
+        NotificationTypes:
+        - autoscaling:EC2_INSTANCE_LAUNCH
+        - autoscaling:EC2_INSTANCE_TERMINATE
+        - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+        - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+        PropagateAtLaunch: true
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+
+Outputs:
+  NotificationTopic:
+    Description: Monitoring notification topic
+    Value: !Ref NotificationTopic
+
+  DashboardUrl:
+    Description: Ethermine Dashboard URL
+    Value: !Sub "https://ethermine.org/miners/${EthWallet}/dashboard"
